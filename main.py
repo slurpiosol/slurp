@@ -156,6 +156,11 @@ LAMPORTS_PER_SOL = 1_000_000_000
 state_lock = threading.Lock()
 trade_queue = queue.Queue() # Async Signal Queue
 
+# Recent Traders Tracking (for lottery)
+from collections import deque
+recent_traders = deque(maxlen=100)  # Keep last 100 unique traders
+traders_lock = threading.Lock()
+
 # State
 position_state = {
     "active": False,
@@ -401,6 +406,11 @@ def on_message(ws, message, client, keypair, my_pubkey):
             if trader == my_pubkey:
                 return
 
+            # Track recent traders for lottery (thread-safe)
+            with traders_lock:
+                if trader not in recent_traders:
+                    recent_traders.append(trader)
+
             # V4.2 ASYNC: Put signal in queue, don't block
             if side == "sell":
                 log("SENSOR", f"⚡ Detected SELL by {trader[:6]}... -> QUEUEING BUY", Style.CYAN)
@@ -455,100 +465,22 @@ def market_sensor_worker(client: Client, keypair: Keypair):
              time.sleep(backoff)
              backoff = min(backoff * 2, 60) 
 
-# --- WORKER: LOTTERY ENGINE (V5.0) ---
-def get_random_holder(client: Client, mint: str) -> str | None:
+# --- WORKER: LOTTERY ENGINE (V5.0 - WebSocket Based) ---
+def get_random_winner() -> str | None:
     """
-    Fetches holders for the mint and picks a random winner.
-    Tries SolanaTracker API first (fast), falls back to RPC (slow/heavy).
+    Picks a random winner from recent active traders.
+    This approach works for Pump.fun tokens without requiring holder API queries.
     """
-    exclude = [
-        "11111111111111111111111111111111", # System
-        "Dead111111111111111111111111111111111111", # Burn
-        TOKEN_MINT # Token Account
-    ]
-
-    # 1. Try Helius / RPC Directly (Preferred for Accuracy)
-    helius_key = os.getenv("HELIUS_API_KEY")
-    if helius_key:
-        log("LOTTERY", f"✓ Helius API Key Detected (First 4: {helius_key[:4]}...)", Style.CYAN)
-        try:
-            # Correct Helius RPC endpoint format
-            url = f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getProgramAccounts",
-                "params": [
-                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", # SPL Token Program
-                    {
-                        "encoding": "jsonParsed",
-                        "filters": [
-                            {"dataSize": 165},
-                            {"memcmp": {"offset": 0, "bytes": mint}}
-                        ]
-                    }
-                ]
-            }
-            log("LOTTERY", "→ Fetching holders via Helius RPC...", Style.DIM)
-            res = requests.post(url, json=payload, timeout=15)
-            
-            if res.status_code == 200:
-                data = res.json()
-                
-                # Check for JSON-RPC error response
-                if "error" in data:
-                    log("WARN", f"Helius RPC Error: {data['error']}", Style.YELLOW)
-                else:
-                    accounts = data.get("result", [])
-                    log("LOTTERY", f"✓ Helius returned {len(accounts)} token accounts", Style.CYAN)
-                    
-                    valid_holders = []
-                    for acc in accounts:
-                        try:
-                            info = acc.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
-                            owner = info.get("owner")
-                            amount = float(info.get("tokenAmount", {}).get("uiAmount", 0))
-                            
-                            if owner and owner not in exclude and amount > 0:
-                                valid_holders.append(owner)
-                        except: continue
-
-                    if valid_holders:
-                        log("LOTTERY", f"✓ Found {len(valid_holders)} valid holders via Helius", Style.GREEN)
-                        return random.choice(valid_holders)
-                    else:
-                        log("LOTTERY", "No valid holders after filtering (Helius)", Style.YELLOW)
-            else:
-                 log("WARN", f"Helius HTTP Error: {res.status_code} - {res.text[:200]}", Style.YELLOW)
-
-        except Exception as e:
-             log("WARN", f"Helius Request Failed: {str(e)}", Style.YELLOW)
-    else:
-        log("LOTTERY", "⚠️ HELIUS_API_KEY not found in environment", Style.YELLOW)
-
-    # 2. Try SolanaTracker API (Fallback)
-    api_key = os.getenv("SOLANATRACKER_API_KEY")
-    if api_key:
-        try:
-            url = f"https://data.solanatracker.io/tokens/{mint}/holders"
-            headers = {"x-api-key": api_key}
-            res = requests.get(url, headers=headers, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                holders = data if isinstance(data, list) else data.get("holders", [])
-                valid_holders = [h for h in holders if h.get("wallet") not in exclude and float(h.get("amount", 0)) > 0]
-                if valid_holders:
-                    winner = random.choice(valid_holders)
-                    return winner.get("wallet")
-            else:
-                 log("WARN", f"Tracker API Error: {res.status_code}", Style.YELLOW)
-        except Exception as e:
-            log("WARN", f"Tracker API Failed: {e}", Style.YELLOW)
-
-    return None
+    with traders_lock:
+        if len(recent_traders) == 0:
+            return None
+        
+        # Convert deque to list and pick random
+        traders_list = list(recent_traders)
+        return random.choice(traders_list) if traders_list else None
 
 def lottery_worker(client: Client, worker_keypair: Keypair):
-    log("SYSTEM", "🎰 Lottery Engine: ACTIVE (Interval: 1m DEBUG)", Style.CYAN)
+    log("SYSTEM", "🎰 Lottery Engine: ACTIVE (WebSocket-Based, Interval: 1m)", Style.CYAN)
     
     while True:
         try:
@@ -577,10 +509,19 @@ def lottery_worker(client: Client, worker_keypair: Keypair):
                 time.sleep(60)
                 continue
 
-            log("LOTTERY", f"🎲 Running Draw... Prize: {prize:.4f} SOL", Style.MAGENTA)
+            # Check if we have recent traders
+            with traders_lock:
+                trader_count = len(recent_traders)
+            
+            if trader_count == 0:
+                log("LOTTERY", "⏳ No recent traders yet. Waiting for activity...", Style.DIM)
+                time.sleep(60)
+                continue
 
-            # 3. Pick Winner
-            winner_pub = get_random_holder(client, TOKEN_MINT)
+            log("LOTTERY", f"🎲 Running Draw... Prize: {prize:.4f} SOL | Traders: {trader_count}", Style.MAGENTA)
+
+            # 3. Pick Winner from recent traders
+            winner_pub = get_random_winner()
             
             if winner_pub:
                  # Prevent self-transfer
@@ -596,7 +537,7 @@ def lottery_worker(client: Client, worker_keypair: Keypair):
                 if sig:
                     log("WINNER", f"🎉 SENT {prize:.4f} SOL -> {winner_pub[:4]}.. | Tx: {sig[:8]}", Style.GREEN)
             else:
-                 log("LOTTERY", "⚠️ Could not fetch holders. Skipping.", Style.YELLOW)
+                 log("LOTTERY", "⚠️ Could not select winner. Skipping.", Style.YELLOW)
 
         except Exception as e:
             import traceback
